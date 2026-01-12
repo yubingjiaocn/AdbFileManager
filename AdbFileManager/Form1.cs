@@ -391,7 +391,110 @@ namespace AdbFileManager {
 			copying = false;
 		}
 
+		public async Task pushFilesAsync(ShellObject[] items, string destinationPath) {
+			string dateArg = checkBox_filedate.Checked ? " -a " : "";
+			string progressArg = " -p";
 
+			int totalFiles = items.Length;
+			int processedFiles = 0;
+
+			Form progressbar = null;
+			Console.WriteLine($"files: {items.Length} two pb: {SettingsManager.settings.ShowTwoProgressBars}");
+			if(items.Length > 1 && SettingsManager.settings.ShowTwoProgressBars) {
+				progressbar = new Form2New();
+			}
+			else {
+				progressbar = new Form2();
+			}
+			progressbar.Show();
+			progressbar.BringToFront();
+			progressbar.Activate();
+			progressbar.Focus();
+
+			copying = true;
+
+			// Start persistent pipe server once
+			AdbFileManager.AdbProgressRunner.StartPipeServer();
+
+			// Subscribe to progress events
+			AdbFileManager.AdbProgressRunner.OnProgressReceived = async filePercent => {
+				Console.WriteLine("PUSH PROGRESS: " + filePercent);
+				float totalPercent = (processedFiles * 100f / totalFiles)
+								   + (filePercent * (1f / totalFiles));
+
+				UpdateProgressBar(
+					progressbar,
+					processedFiles,
+					totalFiles,
+					explorer_path.Text,
+					destinationPath,
+					Path.GetFileName(items[processedFiles].ParsingName),
+					totalPercent,
+					filePercent
+				);
+
+				await Task.CompletedTask;
+			};
+
+			string adbPath = Path.Combine(AppContext.BaseDirectory, "adb.exe");
+
+			foreach(var item in items) {
+				string sourceFile = item.ParsingName;
+
+				string deviceArg = "";
+				if(selectedDevice != null) {
+					deviceArg = $"-s {selectedDevice.adbId} ";
+					Console.WriteLine("Using selected device in adb push: " + selectedDevice.adbId);
+				}
+
+				// Build the adb push command for this file
+				string command = $"{deviceArg} push {dateArg}{progressArg} \"{sourceFile}\" \"{Functions.FixWindowsPath(destinationPath)}\"";
+				Console.WriteLine($"[ASYNC PUSH] {command}");
+
+				UpdateProgressBar(
+					progressbar,
+					processedFiles,
+					totalFiles,
+					explorer_path.Text,
+					destinationPath,
+					Path.GetFileName(sourceFile),
+					processedFiles * 100f / totalFiles,
+					0f
+				);
+
+				// Run adb with injection & progress capture
+				await AdbFileManager.AdbProgressRunner.RunAsync(adbPath, command);
+				Console.WriteLine("Finished awaiting adb push command");
+
+				processedFiles++;
+
+				if(processedFiles == totalFiles) break;
+				UpdateProgressBar(
+					progressbar,
+					processedFiles,
+					totalFiles,
+					explorer_path.Text,
+					destinationPath,
+					Path.GetFileName(items[processedFiles].ParsingName),
+					processedFiles * 100f / totalFiles,
+					100f
+				);
+			}
+
+			if(progressbar is Form2New pbarNew) {
+				Console.WriteLine("closing 2 bar progress bar");
+				pbarNew.delete();
+			}
+			else if(progressbar is Form2 pbarOld) {
+				Console.WriteLine("closing 1 bar progress bar");
+				pbarOld.delete();
+			}
+			else {
+				Console.WriteLine("Error bad progressbar type");
+			}
+
+			copying = false;
+		}
 
 		public void copyFilesLegacy(List<File> files, string destinationFolder) {
 			string date = checkBox_filedate.Checked ? " -a " : "";
@@ -593,28 +696,16 @@ namespace AdbFileManager {
 
 		}
 
-		private void pc2android_Click(object sender, EventArgs e) {
-			var items = explorerBrowser1.SelectedItems.ToArray();
-			string date = checkBox_filedate.Checked ? " -a " : "";
-			int filecount = items.Count();
-			int copied = 0;
-			Form2 progressbar = new Form2();
-			progressbar.Show();
-			//try to make the progressbar get shown
-			progressbar.BringToFront();
-			progressbar.Activate();
-			progressbar.Focus();
-			copying = true;
-			foreach(ShellObject item in items) {
-				string sourcefile = item.ParsingName;
-				string command = $"adb push {date} \"{sourcefile}\" \"{Functions.FixWindowsPath(directoryPath)}\"";
-				Console.WriteLine(command);
-				progressbar.Update(copied, filecount, explorer_path.Text, directoryPath, sourcefile);
-				Console.WriteLine(adb(command));
-				copied++;
+		private async void pc2android_Click(object sender, EventArgs e) {
+			if(copying) {
+				MessageBox.Show(rm.GetString("copy_in_progress"), rm.GetString("copy_in_progress_title"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+				return;
 			}
-			progressbar.Close();
-			copying = false;
+
+			var items = explorerBrowser1.SelectedItems.ToArray();
+			if(items.Length == 0) return;
+
+			await pushFilesAsync(items, directoryPath);
 		}
 
 		bool cur_path_modifyInternal = false;
