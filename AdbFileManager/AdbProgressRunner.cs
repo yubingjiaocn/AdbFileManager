@@ -109,7 +109,6 @@ namespace AdbFileManager {
 				var readTask = Task.Run(() => {
 					Log("[Runner] Read task started");
 					var buffer = new byte[1024];
-					var lineBuffer = new StringBuilder();
 					int lastProgress = -1;
 					int totalBytesRead = 0;
 
@@ -117,34 +116,25 @@ namespace AdbFileManager {
 					using var outputStream = new FileStream(safeHandle, FileAccess.Read);
 
 					try {
+						// Regex to find progress patterns like "[ 42%]" or "[100%]"
+						var progressRegex = new System.Text.RegularExpressions.Regex(@"\[\s*(\d+)%\]");
+
 						int bytesRead;
 						while((bytesRead = outputStream.Read(buffer, 0, buffer.Length)) > 0) {
 							totalBytesRead += bytesRead;
 							string text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-							Log($"[Runner] Read {bytesRead} bytes: {text.Replace("\r", "\\r").Replace("\n", "\\n").Substring(0, Math.Min(100, text.Length))}");
 
-							foreach(char c in text) {
-								if(c == '\r' || c == '\n') {
-									if(lineBuffer.Length > 0) {
-										string line = lineBuffer.ToString();
-										// Filter out ANSI escape sequences for logging
-										string cleanLine = System.Text.RegularExpressions.Regex.Replace(line, @"\x1B\[[0-9;]*[a-zA-Z]", "");
-										if(!string.IsNullOrWhiteSpace(cleanLine)) {
-											Log("[ADB] " + cleanLine);
-											int pct = ParseProgress(cleanLine);
-											if(pct >= 0 && pct != lastProgress) {
-												lastProgress = pct;
-												Log($"[Runner] Progress: {pct}%");
-												if(OnProgressReceived != null) {
-													_ = Task.Run(() => OnProgressReceived(pct));
-												}
-											}
+							// Extract progress directly from the chunk (don't wait for line delimiters)
+							var matches = progressRegex.Matches(text);
+							foreach(System.Text.RegularExpressions.Match match in matches) {
+								if(int.TryParse(match.Groups[1].Value, out int pct)) {
+									if(pct >= 0 && pct <= 100 && pct != lastProgress) {
+										lastProgress = pct;
+										Log($"[Runner] Progress: {pct}%");
+										if(OnProgressReceived != null) {
+											_ = Task.Run(() => OnProgressReceived(pct));
 										}
-										lineBuffer.Clear();
 									}
-								}
-								else {
-									lineBuffer.Append(c);
 								}
 							}
 						}
