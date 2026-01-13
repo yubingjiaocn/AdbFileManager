@@ -487,6 +487,9 @@ namespace AdbFileManager {
 				Console.WriteLine("Error bad progressbar type");
 			}
 
+			// Refresh Android file list after copy
+			dataGridView_soubory.DataSource = Functions.getDir(directoryPath, checkBox_android6fix.Checked, checkBox_android6fix_fastmode.Checked);
+
 			copying = false;
 		}
 
