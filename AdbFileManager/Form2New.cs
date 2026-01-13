@@ -68,6 +68,8 @@ namespace AdbFileManager {
 
 		private void Form2_FormClosed(object sender, FormClosedEventArgs e) {
 			TaskbarManager.Instance.SetProgressState(TaskbarProgressBarState.NoProgress);
+			// Cancel the running ADB process when progress dialog is closed
+			AdbProgressRunner.Cancel();
 		}
 		public static void set_language() {
 			Thread.CurrentThread.CurrentUICulture = new CultureInfo("cs-CZ");
