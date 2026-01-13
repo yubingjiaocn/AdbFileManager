@@ -10,6 +10,7 @@ namespace AdbFileManager {
 	public static class AdbProgressRunner {
 		public static Func<int, Task>? OnProgressReceived;
 		private static int _currentProcessId;
+		private static string? _adbPath;
 		private static readonly object _processLock = new object();
 
 		/// <summary>
@@ -17,36 +18,81 @@ namespace AdbFileManager {
 		/// </summary>
 		public static void Cancel() {
 			int pid;
+			string? adbPath;
 			lock(_processLock) {
 				pid = _currentProcessId;
+				adbPath = _adbPath;
 				_currentProcessId = 0;
 			}
 
+			Log($"[Runner] Cancel() called. PID={pid}");
+
 			if(pid > 0) {
-				Log($"[Runner] Cancelling process (PID={pid})");
+				Log($"[Runner] Attempting to cancel process (PID={pid})");
+
+				// First try taskkill which is more reliable for killing process trees
+				try {
+					Log($"[Runner] Using taskkill /F /T /PID {pid}");
+					using var taskkill = Process.Start(new ProcessStartInfo {
+						FileName = "taskkill",
+						Arguments = $"/F /T /PID {pid}",
+						UseShellExecute = false,
+						CreateNoWindow = true,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true
+					});
+					if(taskkill != null) {
+						taskkill.WaitForExit(5000);
+						Log($"[Runner] taskkill exit code: {taskkill.ExitCode}");
+					}
+				}
+				catch(Exception ex) {
+					Log($"[Runner] taskkill failed: {ex.Message}");
+				}
+
+				// Also try Process.Kill as backup
 				try {
 					using var process = Process.GetProcessById(pid);
-					process.Kill(entireProcessTree: true);
-					Log($"[Runner] Process killed successfully");
+					if(!process.HasExited) {
+						process.Kill(entireProcessTree: true);
+						Log($"[Runner] Process.Kill succeeded");
+					}
 				}
 				catch(ArgumentException) {
-					// Process already exited
 					Log($"[Runner] Process {pid} already exited");
 				}
 				catch(Exception ex) {
-					Log($"[Runner] Failed to kill process: {ex.Message}");
-					// Try taskkill as fallback
+					Log($"[Runner] Process.Kill failed: {ex.Message}");
+				}
+
+				// Restart ADB server to clean up device connection
+				if(!string.IsNullOrEmpty(adbPath) && System.IO.File.Exists(adbPath)) {
 					try {
-						using var taskkill = Process.Start(new ProcessStartInfo {
-							FileName = "taskkill",
-							Arguments = $"/F /T /PID {pid}",
+						Log($"[Runner] Restarting ADB server to clean up connection");
+						using var killServer = Process.Start(new ProcessStartInfo {
+							FileName = adbPath,
+							Arguments = "kill-server",
 							UseShellExecute = false,
 							CreateNoWindow = true
 						});
-						taskkill?.WaitForExit(3000);
+						killServer?.WaitForExit(3000);
+
+						using var startServer = Process.Start(new ProcessStartInfo {
+							FileName = adbPath,
+							Arguments = "start-server",
+							UseShellExecute = false,
+							CreateNoWindow = true
+						});
+						startServer?.WaitForExit(3000);
+						Log($"[Runner] ADB server restarted");
 					}
-					catch { }
+					catch(Exception ex) {
+						Log($"[Runner] Failed to restart ADB server: {ex.Message}");
+					}
 				}
+			}
+			else {
+				Log($"[Runner] No process to cancel (PID=0)");
 			}
 		}
 
@@ -55,6 +101,11 @@ namespace AdbFileManager {
 
 			if(string.IsNullOrWhiteSpace(adbPath)) throw new ArgumentException("adbPath is required", nameof(adbPath));
 			if(!System.IO.File.Exists(adbPath)) throw new FileNotFoundException("adb not found", adbPath);
+
+			// Store adb path for potential server restart on cancel
+			lock(_processLock) {
+				_adbPath = adbPath;
+			}
 
 			adbArgsString ??= string.Empty;
 
