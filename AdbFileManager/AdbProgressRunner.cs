@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using System.Diagnostics;
 
@@ -15,7 +16,6 @@ namespace AdbFileManager {
 
 			adbArgsString ??= string.Empty;
 
-			// Use standard process output redirection to capture ADB progress
 			var psi = new ProcessStartInfo {
 				FileName = adbPath,
 				Arguments = adbArgsString,
@@ -27,34 +27,70 @@ namespace AdbFileManager {
 			};
 
 			using var process = new Process { StartInfo = psi };
-
-			// ADB progress output (with -p flag) goes to stderr
-			process.ErrorDataReceived += (sender, e) => {
-				if(!string.IsNullOrEmpty(e.Data)) {
-					Log("[ADB stderr] " + e.Data);
-					int pct = ParseProgress(e.Data);
-					if(pct >= 0 && OnProgressReceived != null) {
-						Task.Run(() => OnProgressReceived(pct));
-					}
-				}
-			};
-
-			process.OutputDataReceived += (sender, e) => {
-				if(!string.IsNullOrEmpty(e.Data)) {
-					Log("[ADB stdout] " + e.Data);
-				}
-			};
-
 			process.Start();
-			process.BeginErrorReadLine();
-			process.BeginOutputReadLine();
 
 			Log($"[Runner] adb process started (PID={process.Id})");
+
+			// Read stderr in a separate task - ADB progress uses \r to update in place
+			var stderrTask = Task.Run(async () => {
+				var buffer = new StringBuilder();
+				var stream = process.StandardError;
+				var charBuffer = new char[1];
+
+				while(!stream.EndOfStream) {
+					int read = await stream.ReadAsync(charBuffer, 0, 1);
+					if(read == 0) break;
+
+					char c = charBuffer[0];
+
+					if(c == '\r' || c == '\n') {
+						// Line complete - process it
+						if(buffer.Length > 0) {
+							string line = buffer.ToString();
+							Log("[ADB stderr] " + line);
+
+							int pct = ParseProgress(line);
+							if(pct >= 0 && OnProgressReceived != null) {
+								_ = Task.Run(() => OnProgressReceived(pct));
+							}
+
+							buffer.Clear();
+						}
+					}
+					else {
+						buffer.Append(c);
+					}
+				}
+
+				// Process any remaining content
+				if(buffer.Length > 0) {
+					string line = buffer.ToString();
+					Log("[ADB stderr] " + line);
+
+					int pct = ParseProgress(line);
+					if(pct >= 0 && OnProgressReceived != null) {
+						_ = Task.Run(() => OnProgressReceived(pct));
+					}
+				}
+			});
+
+			// Read stdout (usually empty for push/pull)
+			var stdoutTask = Task.Run(async () => {
+				string? line;
+				while((line = await process.StandardOutput.ReadLineAsync()) != null) {
+					if(!string.IsNullOrEmpty(line)) {
+						Log("[ADB stdout] " + line);
+					}
+				}
+			});
+
+			await Task.WhenAll(stderrTask, stdoutTask);
 			await process.WaitForExitAsync();
+
 			Log("[Runner] adb operation finished.");
 		}
 
-		// Parse progress from ADB output: "[ 42%] filename"
+		// Parse progress from ADB output: "[ 42%] filename" or "[100%] filename"
 		private static int ParseProgress(string line) {
 			if(string.IsNullOrEmpty(line)) return -1;
 			int start = line.IndexOf('[');
