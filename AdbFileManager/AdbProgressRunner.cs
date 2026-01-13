@@ -1,156 +1,141 @@
 using System;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 namespace AdbFileManager {
+	/// <summary>
+	/// Runs ADB commands with progress reporting using Windows ConPTY for terminal emulation.
+	/// </summary>
 	public static class AdbProgressRunner {
+		/// <summary>
+		/// Callback invoked when progress percentage is received from ADB.
+		/// </summary>
 		public static Func<int, Task>? OnProgressReceived;
+
 		private static int _currentProcessId;
 		private static string? _adbPath;
-		private static readonly object _processLock = new object();
+		private static readonly object _lock = new();
+		private static readonly Regex ProgressRegex = new(@"\[\s*(\d+)%\]", RegexOptions.Compiled);
 
 		/// <summary>
-		/// Cancels the currently running ADB process, if any.
+		/// Cancels the currently running ADB process and restarts the ADB server.
 		/// </summary>
 		public static void Cancel() {
 			int pid;
 			string? adbPath;
-			lock(_processLock) {
+			lock (_lock) {
 				pid = _currentProcessId;
 				adbPath = _adbPath;
 				_currentProcessId = 0;
 			}
 
-			Log($"[Runner] Cancel() called. PID={pid}");
+			if (pid <= 0) return;
 
-			if(pid > 0) {
-				Log($"[Runner] Attempting to cancel process (PID={pid})");
-
-				// First try taskkill which is more reliable for killing process trees
-				try {
-					Log($"[Runner] Using taskkill /F /T /PID {pid}");
-					using var taskkill = Process.Start(new ProcessStartInfo {
-						FileName = "taskkill",
-						Arguments = $"/F /T /PID {pid}",
-						UseShellExecute = false,
-						CreateNoWindow = true,
-						RedirectStandardOutput = true,
-						RedirectStandardError = true
-					});
-					if(taskkill != null) {
-						taskkill.WaitForExit(5000);
-						Log($"[Runner] taskkill exit code: {taskkill.ExitCode}");
-					}
-				}
-				catch(Exception ex) {
-					Log($"[Runner] taskkill failed: {ex.Message}");
-				}
-
-				// Also try Process.Kill as backup
+			// Kill process tree using taskkill (most reliable on Windows)
+			try {
+				using var taskkill = Process.Start(new ProcessStartInfo {
+					FileName = "taskkill",
+					Arguments = $"/F /T /PID {pid}",
+					UseShellExecute = false,
+					CreateNoWindow = true,
+					RedirectStandardOutput = true,
+					RedirectStandardError = true
+				});
+				taskkill?.WaitForExit(5000);
+			}
+			catch {
+				// Fallback to Process.Kill
 				try {
 					using var process = Process.GetProcessById(pid);
-					if(!process.HasExited) {
+					if (!process.HasExited) {
 						process.Kill(entireProcessTree: true);
-						Log($"[Runner] Process.Kill succeeded");
 					}
 				}
-				catch(ArgumentException) {
-					Log($"[Runner] Process {pid} already exited");
-				}
-				catch(Exception ex) {
-					Log($"[Runner] Process.Kill failed: {ex.Message}");
-				}
-
-				// Restart ADB server to clean up device connection
-				if(!string.IsNullOrEmpty(adbPath) && System.IO.File.Exists(adbPath)) {
-					try {
-						Log($"[Runner] Restarting ADB server to clean up connection");
-						using var killServer = Process.Start(new ProcessStartInfo {
-							FileName = adbPath,
-							Arguments = "kill-server",
-							UseShellExecute = false,
-							CreateNoWindow = true
-						});
-						killServer?.WaitForExit(3000);
-
-						using var startServer = Process.Start(new ProcessStartInfo {
-							FileName = adbPath,
-							Arguments = "start-server",
-							UseShellExecute = false,
-							CreateNoWindow = true
-						});
-						startServer?.WaitForExit(3000);
-						Log($"[Runner] ADB server restarted");
-					}
-					catch(Exception ex) {
-						Log($"[Runner] Failed to restart ADB server: {ex.Message}");
-					}
-				}
+				catch { }
 			}
-			else {
-				Log($"[Runner] No process to cancel (PID=0)");
+
+			// Restart ADB server to clean up device connection
+			if (!string.IsNullOrEmpty(adbPath) && System.IO.File.Exists(adbPath)) {
+				RestartAdbServer(adbPath);
 			}
 		}
 
+		/// <summary>
+		/// Runs an ADB command asynchronously with progress reporting.
+		/// </summary>
 		public static async Task RunAsync(string adbPath, string adbArgsString) {
-			Log($"[Runner] Starting ADB. Path='{adbPath}' Args='{adbArgsString}'");
+			if (string.IsNullOrWhiteSpace(adbPath))
+				throw new ArgumentException("adbPath is required", nameof(adbPath));
+			if (!System.IO.File.Exists(adbPath))
+				throw new FileNotFoundException("ADB executable not found", adbPath);
 
-			if(string.IsNullOrWhiteSpace(adbPath)) throw new ArgumentException("adbPath is required", nameof(adbPath));
-			if(!System.IO.File.Exists(adbPath)) throw new FileNotFoundException("adb not found", adbPath);
-
-			// Store adb path for potential server restart on cancel
-			lock(_processLock) {
+			lock (_lock) {
 				_adbPath = adbPath;
 			}
 
-			adbArgsString ??= string.Empty;
-
-			// Try ConPTY on Windows 10 1809+, fall back to regular Process if unavailable
-			if(ConPtySupported()) {
-				Log("[Runner] Using ConPTY for terminal emulation");
-				await RunWithConPtyAsync(adbPath, adbArgsString);
+			if (IsConPtySupported()) {
+				await RunWithConPtyAsync(adbPath, adbArgsString ?? string.Empty);
 			}
 			else {
-				Log("[Runner] ConPTY not available, using standard process");
-				await RunWithProcessAsync(adbPath, adbArgsString);
+				await RunWithProcessAsync(adbPath, adbArgsString ?? string.Empty);
 			}
 		}
 
-		private static bool ConPtySupported() {
-			// ConPTY requires Windows 10 1809 (build 17763) or later
-			if(!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
+		private static bool IsConPtySupported() {
+			if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
 			var version = Environment.OSVersion.Version;
 			return version.Major > 10 || (version.Major == 10 && version.Build >= 17763);
 		}
 
-		private static async Task RunWithConPtyAsync(string adbPath, string adbArgsString) {
+		private static void RestartAdbServer(string adbPath) {
+			try {
+				using var kill = Process.Start(new ProcessStartInfo {
+					FileName = adbPath,
+					Arguments = "kill-server",
+					UseShellExecute = false,
+					CreateNoWindow = true
+				});
+				kill?.WaitForExit(3000);
+
+				using var start = Process.Start(new ProcessStartInfo {
+					FileName = adbPath,
+					Arguments = "start-server",
+					UseShellExecute = false,
+					CreateNoWindow = true
+				});
+				start?.WaitForExit(3000);
+			}
+			catch { }
+		}
+
+		private static async Task RunWithConPtyAsync(string adbPath, string args) {
 			IntPtr inputReadSide = IntPtr.Zero, inputWriteSide = IntPtr.Zero;
 			IntPtr outputReadSide = IntPtr.Zero, outputWriteSide = IntPtr.Zero;
 			IntPtr hPC = IntPtr.Zero;
+			IntPtr hProcess = IntPtr.Zero;
 
 			try {
-				// Create pipes for communication
+				// Create pipes
 				var sa = new SECURITY_ATTRIBUTES { bInheritHandle = true };
 				sa.nLength = Marshal.SizeOf(sa);
 
-				if(!CreatePipe(out inputReadSide, out inputWriteSide, ref sa, 0))
+				if (!CreatePipe(out inputReadSide, out inputWriteSide, ref sa, 0))
 					throw new InvalidOperationException("Failed to create input pipe");
-				if(!CreatePipe(out outputReadSide, out outputWriteSide, ref sa, 0))
+				if (!CreatePipe(out outputReadSide, out outputWriteSide, ref sa, 0))
 					throw new InvalidOperationException("Failed to create output pipe");
 
 				// Create pseudo console
 				var size = new COORD { X = 120, Y = 30 };
 				int hr = CreatePseudoConsole(size, inputReadSide, outputWriteSide, 0, out hPC);
-				if(hr != 0)
+				if (hr != 0)
 					throw new InvalidOperationException($"CreatePseudoConsole failed: 0x{hr:X8}");
 
-				Log("[Runner] Pseudo console created");
-
-				// Prepare startup info
+				// Prepare startup info with pseudo console attribute
 				var siEx = new STARTUPINFOEX();
 				siEx.StartupInfo.cb = Marshal.SizeOf<STARTUPINFOEX>();
 
@@ -158,132 +143,97 @@ namespace AdbFileManager {
 				InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref lpSize);
 				siEx.lpAttributeList = Marshal.AllocHGlobal(lpSize);
 
-				if(!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, ref lpSize))
+				if (!InitializeProcThreadAttributeList(siEx.lpAttributeList, 1, 0, ref lpSize))
 					throw new InvalidOperationException("InitializeProcThreadAttributeList failed");
 
-				if(!UpdateProcThreadAttribute(siEx.lpAttributeList, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+				if (!UpdateProcThreadAttribute(siEx.lpAttributeList, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
 					hPC, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
 					throw new InvalidOperationException("UpdateProcThreadAttribute failed");
 
 				// Create process
-				string cmdLine = $"\"{adbPath}\" {adbArgsString}";
 				var pi = new PROCESS_INFORMATION();
-
-				bool success = CreateProcessEx(
-					null,
-					cmdLine,
-					IntPtr.Zero,
-					IntPtr.Zero,
-					false,
+				bool success = CreateProcess(
+					null, $"\"{adbPath}\" {args}",
+					IntPtr.Zero, IntPtr.Zero, false,
 					EXTENDED_STARTUPINFO_PRESENT,
-					IntPtr.Zero,
-					Path.GetDirectoryName(adbPath),
-					ref siEx,  // Pass full STARTUPINFOEX with lpAttributeList
-					out pi);
+					IntPtr.Zero, Path.GetDirectoryName(adbPath),
+					ref siEx, out pi);
 
-				if(!success)
+				if (!success)
 					throw new InvalidOperationException($"CreateProcess failed: {Marshal.GetLastWin32Error()}");
 
-				Log($"[Runner] Process created (PID={pi.dwProcessId})");
-
-				// Close handles we don't need
+				hProcess = pi.hProcess;
 				CloseHandle(pi.hThread);
 				CloseHandle(inputReadSide);
 				CloseHandle(outputWriteSide);
 				inputReadSide = IntPtr.Zero;
 				outputWriteSide = IntPtr.Zero;
 
-				// Track the process for cancellation
-				lock(_processLock) {
+				lock (_lock) {
 					_currentProcessId = (int)pi.dwProcessId;
 				}
 
-				using var process = Process.GetProcessById((int)pi.dwProcessId);
-
 				// Read output from pseudo console
 				var outputHandle = outputReadSide;
-				outputReadSide = IntPtr.Zero; // Transfer ownership to read task
+				outputReadSide = IntPtr.Zero;
 
-				var readTask = Task.Run(() => {
-					Log("[Runner] Read task started");
-					var buffer = new byte[1024];
-					int lastProgress = -1;
-					int totalBytesRead = 0;
+				var readTask = Task.Run(() => ReadProgressOutput(outputHandle));
 
-					using var safeHandle = new SafeFileHandle(outputHandle, true); // owns handle
-					using var outputStream = new FileStream(safeHandle, FileAccess.Read);
-
-					try {
-						// Regex to find progress patterns like "[ 42%]" or "[100%]"
-						var progressRegex = new System.Text.RegularExpressions.Regex(@"\[\s*(\d+)%\]");
-
-						int bytesRead;
-						while((bytesRead = outputStream.Read(buffer, 0, buffer.Length)) > 0) {
-							totalBytesRead += bytesRead;
-							string text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-
-							// Extract progress directly from the chunk (don't wait for line delimiters)
-							var matches = progressRegex.Matches(text);
-							foreach(System.Text.RegularExpressions.Match match in matches) {
-								if(int.TryParse(match.Groups[1].Value, out int pct)) {
-									if(pct >= 0 && pct <= 100 && pct != lastProgress) {
-										lastProgress = pct;
-										Log($"[Runner] Progress: {pct}%");
-										if(OnProgressReceived != null) {
-											_ = Task.Run(() => OnProgressReceived(pct));
-										}
-									}
-								}
-							}
-						}
-						Log($"[Runner] Read loop ended, total bytes: {totalBytesRead}");
-					}
-					catch(Exception ex) {
-						Log($"[Runner] Read error: {ex.Message}");
-					}
-				});
-
-				// Wait for process to exit
+				using var process = Process.GetProcessById((int)pi.dwProcessId);
 				await process.WaitForExitAsync();
 
-				Log($"[Runner] Process exited with code {process.ExitCode}");
-
-				// Clear process reference
-				lock(_processLock) {
+				lock (_lock) {
 					_currentProcessId = 0;
 				}
 
-				// Close pseudo console first - this signals EOF to the reader
-				if(hPC != IntPtr.Zero) {
+				// Close pseudo console to signal EOF
+				if (hPC != IntPtr.Zero) {
 					ClosePseudoConsole(hPC);
 					hPC = IntPtr.Zero;
 				}
 
-				// Now wait for reader to finish (with timeout)
-				Log("[Runner] Waiting for read task to complete...");
-				if(await Task.WhenAny(readTask, Task.Delay(3000)) != readTask) {
-					Log("[Runner] Read task timed out");
-				}
-
-				CloseHandle(pi.hProcess);
+				await Task.WhenAny(readTask, Task.Delay(3000));
 			}
 			finally {
-				lock(_processLock) {
+				lock (_lock) {
 					_currentProcessId = 0;
 				}
-				if(inputReadSide != IntPtr.Zero) CloseHandle(inputReadSide);
-				if(inputWriteSide != IntPtr.Zero) CloseHandle(inputWriteSide);
-				if(outputReadSide != IntPtr.Zero) CloseHandle(outputReadSide);
-				if(outputWriteSide != IntPtr.Zero) CloseHandle(outputWriteSide);
-				if(hPC != IntPtr.Zero) ClosePseudoConsole(hPC);
+				if (inputReadSide != IntPtr.Zero) CloseHandle(inputReadSide);
+				if (inputWriteSide != IntPtr.Zero) CloseHandle(inputWriteSide);
+				if (outputReadSide != IntPtr.Zero) CloseHandle(outputReadSide);
+				if (outputWriteSide != IntPtr.Zero) CloseHandle(outputWriteSide);
+				if (hPC != IntPtr.Zero) ClosePseudoConsole(hPC);
+				if (hProcess != IntPtr.Zero) CloseHandle(hProcess);
 			}
 		}
 
-		private static async Task RunWithProcessAsync(string adbPath, string adbArgsString) {
-			// Fallback for non-ConPTY systems
+		private static void ReadProgressOutput(IntPtr outputHandle) {
+			var buffer = new byte[1024];
+			int lastProgress = -1;
+
+			using var safeHandle = new SafeFileHandle(outputHandle, true);
+			using var stream = new FileStream(safeHandle, FileAccess.Read);
+
+			try {
+				int bytesRead;
+				while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0) {
+					string text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+					foreach (Match match in ProgressRegex.Matches(text)) {
+						if (int.TryParse(match.Groups[1].Value, out int pct) &&
+							pct >= 0 && pct <= 100 && pct != lastProgress) {
+							lastProgress = pct;
+							OnProgressReceived?.Invoke(pct);
+						}
+					}
+				}
+			}
+			catch { }
+		}
+
+		private static async Task RunWithProcessAsync(string adbPath, string args) {
 			var psi = new ProcessStartInfo {
 				FileName = adbPath,
-				Arguments = adbArgsString,
+				Arguments = args,
 				UseShellExecute = false,
 				RedirectStandardOutput = true,
 				RedirectStandardError = true,
@@ -294,30 +244,28 @@ namespace AdbFileManager {
 			using var process = new Process { StartInfo = psi };
 			process.Start();
 
-			Log($"[Runner] Process started (PID={process.Id})");
-
-			// Track the process for cancellation
-			lock(_processLock) {
+			lock (_lock) {
 				_currentProcessId = process.Id;
 			}
 
+			int lastProgress = -1;
 			var stderrTask = Task.Run(async () => {
 				var buffer = new StringBuilder();
 				var stream = process.StandardError.BaseStream;
 				var byteBuffer = new byte[1];
 
-				while(true) {
+				while (true) {
 					int bytesRead = await stream.ReadAsync(byteBuffer, 0, 1);
-					if(bytesRead == 0) break;
+					if (bytesRead == 0) break;
 
 					char c = (char)byteBuffer[0];
-					if(c == '\r' || c == '\n') {
-						if(buffer.Length > 0) {
-							string line = buffer.ToString();
-							Log("[ADB stderr] " + line);
-							int pct = ParseProgress(line);
-							if(pct >= 0 && OnProgressReceived != null) {
-								_ = Task.Run(() => OnProgressReceived(pct));
+					if (c == '\r' || c == '\n') {
+						if (buffer.Length > 0) {
+							var match = ProgressRegex.Match(buffer.ToString());
+							if (match.Success && int.TryParse(match.Groups[1].Value, out int pct) &&
+								pct >= 0 && pct <= 100 && pct != lastProgress) {
+								lastProgress = pct;
+								OnProgressReceived?.Invoke(pct);
 							}
 							buffer.Clear();
 						}
@@ -328,32 +276,12 @@ namespace AdbFileManager {
 				}
 			});
 
-			var stdoutTask = process.StandardOutput.ReadToEndAsync();
-
-			await Task.WhenAll(stderrTask, stdoutTask);
+			await Task.WhenAll(stderrTask, process.StandardOutput.ReadToEndAsync());
 			await process.WaitForExitAsync();
 
-			// Clear process reference
-			lock(_processLock) {
+			lock (_lock) {
 				_currentProcessId = 0;
 			}
-
-			Log($"[Runner] Process exited with code {process.ExitCode}");
-		}
-
-		private static int ParseProgress(string line) {
-			if(string.IsNullOrEmpty(line)) return -1;
-			int start = line.IndexOf('[');
-			int end = line.IndexOf('%');
-			if(start >= 0 && end > start) {
-				string number = line.Substring(start + 1, end - start - 1).Trim();
-				if(int.TryParse(number, out int pct)) return pct;
-			}
-			return -1;
-		}
-
-		private static void Log(string msg) {
-			Console.WriteLine($"[DBG] {DateTime.Now:HH:mm:ss.fff} {msg}");
 		}
 
 		#region Native Methods
@@ -381,20 +309,10 @@ namespace AdbFileManager {
 			public string lpReserved;
 			public string lpDesktop;
 			public string lpTitle;
-			public int dwX;
-			public int dwY;
-			public int dwXSize;
-			public int dwYSize;
-			public int dwXCountChars;
-			public int dwYCountChars;
-			public int dwFillAttribute;
-			public int dwFlags;
-			public short wShowWindow;
-			public short cbReserved2;
-			public IntPtr lpReserved2;
-			public IntPtr hStdInput;
-			public IntPtr hStdOutput;
-			public IntPtr hStdError;
+			public int dwX, dwY, dwXSize, dwYSize;
+			public int dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+			public short wShowWindow, cbReserved2;
+			public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
 		}
 
 		[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -405,52 +323,34 @@ namespace AdbFileManager {
 
 		[StructLayout(LayoutKind.Sequential)]
 		private struct PROCESS_INFORMATION {
-			public IntPtr hProcess;
-			public IntPtr hThread;
-			public uint dwProcessId;
-			public uint dwThreadId;
+			public IntPtr hProcess, hThread;
+			public uint dwProcessId, dwThreadId;
 		}
 
 		[DllImport("kernel32.dll", SetLastError = true)]
-		private static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
+		private static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe,
+			ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
-		private static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);
+		private static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput,
+			uint dwFlags, out IntPtr phPC);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
 		private static extern void ClosePseudoConsole(IntPtr hPC);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
-		private static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+		private static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList,
+			int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
-		private static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
-
-		[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-		private static extern bool CreateProcess(
-			string? lpApplicationName,
-			string lpCommandLine,
-			IntPtr lpProcessAttributes,
-			IntPtr lpThreadAttributes,
-			bool bInheritHandles,
-			uint dwCreationFlags,
-			IntPtr lpEnvironment,
-			string? lpCurrentDirectory,
-			ref STARTUPINFO lpStartupInfo,
-			out PROCESS_INFORMATION lpProcessInformation);
+		private static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags,
+			IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
 
 		[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateProcessW")]
-		private static extern bool CreateProcessEx(
-			string? lpApplicationName,
-			string lpCommandLine,
-			IntPtr lpProcessAttributes,
-			IntPtr lpThreadAttributes,
-			bool bInheritHandles,
-			uint dwCreationFlags,
-			IntPtr lpEnvironment,
-			string? lpCurrentDirectory,
-			ref STARTUPINFOEX lpStartupInfo,
-			out PROCESS_INFORMATION lpProcessInformation);
+		private static extern bool CreateProcess(string? lpApplicationName, string lpCommandLine,
+			IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles,
+			uint dwCreationFlags, IntPtr lpEnvironment, string? lpCurrentDirectory,
+			ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
 		private static extern bool CloseHandle(IntPtr hObject);
