@@ -9,28 +9,44 @@ using Microsoft.Win32.SafeHandles;
 namespace AdbFileManager {
 	public static class AdbProgressRunner {
 		public static Func<int, Task>? OnProgressReceived;
-		private static Process? _currentProcess;
+		private static int _currentProcessId;
 		private static readonly object _processLock = new object();
 
 		/// <summary>
 		/// Cancels the currently running ADB process, if any.
 		/// </summary>
 		public static void Cancel() {
+			int pid;
 			lock(_processLock) {
-				if(_currentProcess != null && !_currentProcess.HasExited) {
-					Log($"[Runner] Cancelling process (PID={_currentProcess.Id})");
-					try {
-						_currentProcess.Kill(entireProcessTree: true);
-					}
-					catch(Exception ex) {
-						Log($"[Runner] Failed to kill process: {ex.Message}");
-						try {
-							_currentProcess.Kill();
-						}
-						catch { }
-					}
+				pid = _currentProcessId;
+				_currentProcessId = 0;
+			}
+
+			if(pid > 0) {
+				Log($"[Runner] Cancelling process (PID={pid})");
+				try {
+					using var process = Process.GetProcessById(pid);
+					process.Kill(entireProcessTree: true);
+					Log($"[Runner] Process killed successfully");
 				}
-				_currentProcess = null;
+				catch(ArgumentException) {
+					// Process already exited
+					Log($"[Runner] Process {pid} already exited");
+				}
+				catch(Exception ex) {
+					Log($"[Runner] Failed to kill process: {ex.Message}");
+					// Try taskkill as fallback
+					try {
+						using var taskkill = Process.Start(new ProcessStartInfo {
+							FileName = "taskkill",
+							Arguments = $"/F /T /PID {pid}",
+							UseShellExecute = false,
+							CreateNoWindow = true
+						});
+						taskkill?.WaitForExit(3000);
+					}
+					catch { }
+				}
 			}
 		}
 
@@ -127,10 +143,11 @@ namespace AdbFileManager {
 				outputWriteSide = IntPtr.Zero;
 
 				// Track the process for cancellation
-				using var process = Process.GetProcessById((int)pi.dwProcessId);
 				lock(_processLock) {
-					_currentProcess = process;
+					_currentProcessId = (int)pi.dwProcessId;
 				}
+
+				using var process = Process.GetProcessById((int)pi.dwProcessId);
 
 				// Read output from pseudo console
 				var outputHandle = outputReadSide;
@@ -182,7 +199,7 @@ namespace AdbFileManager {
 
 				// Clear process reference
 				lock(_processLock) {
-					_currentProcess = null;
+					_currentProcessId = 0;
 				}
 
 				// Close pseudo console first - this signals EOF to the reader
@@ -201,7 +218,7 @@ namespace AdbFileManager {
 			}
 			finally {
 				lock(_processLock) {
-					_currentProcess = null;
+					_currentProcessId = 0;
 				}
 				if(inputReadSide != IntPtr.Zero) CloseHandle(inputReadSide);
 				if(inputWriteSide != IntPtr.Zero) CloseHandle(inputWriteSide);
@@ -230,7 +247,7 @@ namespace AdbFileManager {
 
 			// Track the process for cancellation
 			lock(_processLock) {
-				_currentProcess = process;
+				_currentProcessId = process.Id;
 			}
 
 			var stderrTask = Task.Run(async () => {
@@ -267,7 +284,7 @@ namespace AdbFileManager {
 
 			// Clear process reference
 			lock(_processLock) {
-				_currentProcess = null;
+				_currentProcessId = 0;
 			}
 
 			Log($"[Runner] Process exited with code {process.ExitCode}");
