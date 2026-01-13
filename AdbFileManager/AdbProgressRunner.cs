@@ -19,8 +19,26 @@ namespace AdbFileManager {
 
 		private static int _currentProcessId;
 		private static string? _adbPath;
+		private static bool _isCancelled;
 		private static readonly object _lock = new();
 		private static readonly Regex ProgressRegex = new(@"\[\s*(\d+)%\]", RegexOptions.Compiled);
+
+		/// <summary>
+		/// Gets whether the current operation has been cancelled.
+		/// Check this in file loops to stop processing remaining files.
+		/// </summary>
+		public static bool IsCancelled {
+			get { lock (_lock) { return _isCancelled; } }
+		}
+
+		/// <summary>
+		/// Resets the cancellation flag. Call before starting a new batch of files.
+		/// </summary>
+		public static void ResetCancellation() {
+			lock (_lock) {
+				_isCancelled = false;
+			}
+		}
 
 		/// <summary>
 		/// Cancels the currently running ADB process and restarts the ADB server.
@@ -29,6 +47,7 @@ namespace AdbFileManager {
 			int pid;
 			string? adbPath;
 			lock (_lock) {
+				_isCancelled = true;
 				pid = _currentProcessId;
 				adbPath = _adbPath;
 				_currentProcessId = 0;

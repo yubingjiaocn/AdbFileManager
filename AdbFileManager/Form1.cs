@@ -301,6 +301,9 @@ namespace AdbFileManager {
 
 			copying = true;
 
+			// Reset cancellation flag before starting batch
+			AdbFileManager.AdbProgressRunner.ResetCancellation();
+
 			// Subscribe to progress events
 			AdbFileManager.AdbProgressRunner.OnProgressReceived = async filePercent => {
 				Console.WriteLine("PROGRESS: " + filePercent);
@@ -324,13 +327,18 @@ namespace AdbFileManager {
 			string adbPath = Path.Combine(AppContext.BaseDirectory, "adb.exe");
 
 			foreach(var file in files) {
+				// Check if cancelled before processing next file
+				if(AdbFileManager.AdbProgressRunner.IsCancelled) {
+					Console.WriteLine("File transfer cancelled by user");
+					break;
+				}
+
 				string sourceFile = Path.Combine(directoryPath, file.name);
 				string destinationFile = Path.Combine(destinationFolder, file.name).Replace('\\', '/');
 				string finalDirectory = Path.GetDirectoryName(destinationFile)!;
 
 				if(!Directory.Exists(finalDirectory))
 					Directory.CreateDirectory(finalDirectory);
-
 
 				string deviceArg = "";
 				if(selectedDevice != null) {
@@ -410,6 +418,9 @@ namespace AdbFileManager {
 
 			copying = true;
 
+			// Reset cancellation flag before starting batch
+			AdbFileManager.AdbProgressRunner.ResetCancellation();
+
 			// Subscribe to progress events
 			AdbFileManager.AdbProgressRunner.OnProgressReceived = async filePercent => {
 				Console.WriteLine("PUSH PROGRESS: " + filePercent);
@@ -433,6 +444,12 @@ namespace AdbFileManager {
 			string adbPath = Path.Combine(AppContext.BaseDirectory, "adb.exe");
 
 			foreach(var item in items) {
+				// Check if cancelled before processing next file
+				if(AdbFileManager.AdbProgressRunner.IsCancelled) {
+					Console.WriteLine("File transfer cancelled by user");
+					break;
+				}
+
 				string sourceFile = item.ParsingName;
 
 				string deviceArg = "";
