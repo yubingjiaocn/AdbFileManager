@@ -301,9 +301,6 @@ namespace AdbFileManager {
 
 			copying = true;
 
-			// Start persistent pipe server once
-			AdbFileManager.AdbProgressRunner.StartPipeServer();
-
 			// Subscribe to progress events
 			AdbFileManager.AdbProgressRunner.OnProgressReceived = async filePercent => {
 				Console.WriteLine("PROGRESS: " + filePercent);
@@ -412,9 +409,6 @@ namespace AdbFileManager {
 			progressbar.Focus();
 
 			copying = true;
-
-			// Start persistent pipe server once
-			AdbFileManager.AdbProgressRunner.StartPipeServer();
 
 			// Subscribe to progress events
 			AdbFileManager.AdbProgressRunner.OnProgressReceived = async filePercent => {
