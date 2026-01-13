@@ -78,7 +78,7 @@ namespace AdbFileManager {
 				string cmdLine = $"\"{adbPath}\" {adbArgsString}";
 				var pi = new PROCESS_INFORMATION();
 
-				bool success = CreateProcess(
+				bool success = CreateProcessEx(
 					null,
 					cmdLine,
 					IntPtr.Zero,
@@ -87,7 +87,7 @@ namespace AdbFileManager {
 					EXTENDED_STARTUPINFO_PRESENT,
 					IntPtr.Zero,
 					Path.GetDirectoryName(adbPath),
-					ref siEx.StartupInfo,
+					ref siEx,  // Pass full STARTUPINFOEX with lpAttributeList
 					out pi);
 
 				if(!success)
@@ -332,6 +332,19 @@ namespace AdbFileManager {
 			IntPtr lpEnvironment,
 			string? lpCurrentDirectory,
 			ref STARTUPINFO lpStartupInfo,
+			out PROCESS_INFORMATION lpProcessInformation);
+
+		[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateProcessW")]
+		private static extern bool CreateProcessEx(
+			string? lpApplicationName,
+			string lpCommandLine,
+			IntPtr lpProcessAttributes,
+			IntPtr lpThreadAttributes,
+			bool bInheritHandles,
+			uint dwCreationFlags,
+			IntPtr lpEnvironment,
+			string? lpCurrentDirectory,
+			ref STARTUPINFOEX lpStartupInfo,
 			out PROCESS_INFORMATION lpProcessInformation);
 
 		[DllImport("kernel32.dll", SetLastError = true)]
