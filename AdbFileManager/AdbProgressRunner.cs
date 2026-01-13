@@ -103,17 +103,25 @@ namespace AdbFileManager {
 				outputWriteSide = IntPtr.Zero;
 
 				// Read output from pseudo console
+				var outputHandle = outputReadSide;
+				outputReadSide = IntPtr.Zero; // Transfer ownership to read task
+
 				var readTask = Task.Run(() => {
+					Log("[Runner] Read task started");
 					var buffer = new byte[1024];
 					var lineBuffer = new StringBuilder();
 					int lastProgress = -1;
+					int totalBytesRead = 0;
 
-					using var outputStream = new FileStream(new SafeFileHandle(outputReadSide, false), FileAccess.Read);
+					using var safeHandle = new SafeFileHandle(outputHandle, true); // owns handle
+					using var outputStream = new FileStream(safeHandle, FileAccess.Read);
 
 					try {
 						int bytesRead;
 						while((bytesRead = outputStream.Read(buffer, 0, buffer.Length)) > 0) {
+							totalBytesRead += bytesRead;
 							string text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+							Log($"[Runner] Read {bytesRead} bytes: {text.Replace("\r", "\\r").Replace("\n", "\\n").Substring(0, Math.Min(100, text.Length))}");
 
 							foreach(char c in text) {
 								if(c == '\r' || c == '\n') {
@@ -140,6 +148,7 @@ namespace AdbFileManager {
 								}
 							}
 						}
+						Log($"[Runner] Read loop ended, total bytes: {totalBytesRead}");
 					}
 					catch(Exception ex) {
 						Log($"[Runner] Read error: {ex.Message}");
@@ -150,10 +159,20 @@ namespace AdbFileManager {
 				using var process = Process.GetProcessById((int)pi.dwProcessId);
 				await process.WaitForExitAsync();
 
-				// Give reader a moment to finish
-				await Task.WhenAny(readTask, Task.Delay(1000));
-
 				Log($"[Runner] Process exited with code {process.ExitCode}");
+
+				// Close pseudo console first - this signals EOF to the reader
+				if(hPC != IntPtr.Zero) {
+					ClosePseudoConsole(hPC);
+					hPC = IntPtr.Zero;
+				}
+
+				// Now wait for reader to finish (with timeout)
+				Log("[Runner] Waiting for read task to complete...");
+				if(await Task.WhenAny(readTask, Task.Delay(3000)) != readTask) {
+					Log("[Runner] Read task timed out");
+				}
+
 				CloseHandle(pi.hProcess);
 			}
 			finally {
